@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Org Chart</title>
+  <style>
+    :root {
+      --card-width: 220px;
+      --card-min-height: 112px;
+      --card-gap-x: 24px;
+      --card-gap-y: 18px;
+      --block-gap-x: 36px;
+      --manager-gap: 64px;
+      --row-gap: 120px;
+    }
+    body { margin:0; font-family: Inter, Arial, sans-serif; background:#f6f8fb; }
+    .toolbar { position: sticky; top:0; z-index:50; background:#fff; border-bottom:1px solid #e3e8f0; padding:8px 12px; display:flex; gap:8px; align-items:center; }
+    .toolbar button { border:1px solid #c8d4e5; background:#fff; border-radius:8px; padding:6px 10px; cursor:pointer; }
+    .toolbar .meta { color:#4c5b70; font-size:13px; }
+    #viewport { height: calc(100vh - 48px); overflow:auto; padding:20px; }
+    #canvas { position:relative; transform-origin: 0 0; }
+    #lines { position:absolute; inset:0; z-index:1; overflow:visible; }
+    #nodes { position:absolute; inset:0; z-index:2; }
+    .node-card { position:absolute; width:var(--card-width); min-height:var(--card-min-height); background:#fff; border-radius:14px; border:1px solid #dce5f1; box-shadow:0 4px 12px rgba(0,0,0,0.06); padding:10px; box-sizing:border-box; }
+    .card-top { display:flex; gap:10px; }
+    .photo { width:52px; height:52px; border-radius:50%; background:#dce5f1; flex:0 0 auto; object-fit:cover; }
+    .name { font-size:14px; font-weight:700; color:#12233a; line-height:1.25; white-space:normal; word-break:break-word; }
+    .role { margin-top:4px; font-size:13px; color:#3f536e; line-height:1.25; white-space:normal; word-break:break-word; }
+    .badges { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; }
+    .badge { font-size:11px; border-radius:999px; padding:3px 8px; }
+    .b-level { background:#e6eefb; color:#1e4d9f; }
+    .b-dep { background:#e8f7ee; color:#17623d; }
+    .b-unit { background:#fff1dd; color:#8a4e00; }
+    .b-team { background:#f2ebff; color:#5e3d9b; }
+    .group-label { position:absolute; font-size:11px; font-weight:700; border:1px solid #d5deeb; border-radius:8px; padding:4px 8px; background:#ffffffcc; z-index:3; color:#37485f; }
+    .empty { padding:24px; color:#556a84; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="zoomOut">−</button>
+    <button id="zoomIn">+</button>
+    <button id="zoomReset">100%</button>
+    <span class="meta" id="meta"></span>
+  </div>
+  <div id="viewport">
+    <div id="canvas">
+      <svg id="lines"></svg>
+      <div id="nodes"></div>
+    </div>
+  </div>
+
+  <script>
+    const levelRank = { Chief: 0, Head: 1, Lead: 2, IC: 3 };
+    let scale = 1;
+
+    function setZoom(next) {
+      scale = Math.max(0.5, Math.min(2, next));
+      document.getElementById('canvas').style.transform = `scale(${scale})`;
+    }
+    document.getElementById('zoomIn').onclick = () => setZoom(scale + 0.1);
+    document.getElementById('zoomOut').onclick = () => setZoom(scale - 0.1);
+    document.getElementById('zoomReset').onclick = () => setZoom(1);
+
+    google.script.run.withSuccessHandler(init).withFailureHandler(err => {
+      document.body.innerHTML = `<div class="empty">Error: ${err.message}</div>`;
+    }).getOrgData();
+
+    function init(records) {
+      if (!records || !records.length) {
+        document.getElementById('nodes').innerHTML = '<div class="empty">No data found.</div>';
+        return;
+      }
+
+      const nodesByName = new Map();
+      records.forEach(r => nodesByName.set(r.name, {...r, id: r.name, children: [], parent: null}));
+
+      const roots = [];
+      nodesByName.forEach(node => {
+        const mgr = node.manager && nodesByName.get(node.manager);
+        if (mgr) {
+          node.parent = mgr;
+          mgr.children.push(node);
+        } else {
+          roots.push(node);
+        }
+      });
+
+      roots.sort((a,b)=> (levelRank[a.level] ?? 99) - (levelRank[b.level] ?? 99));
+      const ceo = roots.find(r => r.level === 'Chief') || roots[0];
+
+      const groupSort = (arr) => arr.sort((a,b) =>
+        (a.dep || '').localeCompare(b.dep || '') ||
+        (a.unit || '').localeCompare(b.unit || '') ||
+        (a.team || '').localeCompare(b.team || '') ||
+        (a.name || '').localeCompare(b.name || ''));
+
+      nodesByName.forEach(n => groupSort(n.children));
+
+      const layout = computeLayout(ceo);
+      render(layout, ceo);
+      document.getElementById('meta').textContent = `${records.length} employees`;
+    }
+
+    function computeLayout(root) {
+      const cardW = 220, cardH = 130;
+      const cardGapX = 24, blockGapX = 36, managerGap = 64, rowGap = 120;
+      const positions = new Map();
+      const groupLabels = [];
+
+      function subgroupKey(n) {
+        if (n.dep && n.unit && n.team) return `${n.dep}|${n.unit}|${n.team}`;
+        if (n.dep && n.unit) return `${n.dep}|${n.unit}`;
+        if (n.dep && n.team) return `${n.dep}|${n.team}`;
+        if (n.dep) return `${n.dep}`;
+        return '__ungrouped__';
+      }
+
+      function subgroupLabel(n) {
+        const parts = [];
+        if (n.dep) parts.push(`${n.dep} Department`);
+        if (n.unit) parts.push(`${n.unit}`);
+        if (n.team) parts.push(`${n.team}`);
+        return parts.join(' · ');
+      }
+
+      function place(node, left, depth) {
+        const y = depth * (cardH + rowGap);
+        if (!node.children.length) {
+          positions.set(node.id, {x:left, y, w:cardW, h:cardH, node});
+          return {left, right:left+cardW, center:left+cardW/2};
+        }
+
+        const groups = new Map();
+        node.children.forEach(c => {
+          const key = subgroupKey(c);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(c);
+        });
+
+        let cursor = left;
+        const spans = [];
+        for (const children of groups.values()) {
+          let gLeft = cursor;
+          const lanes = [];
+          const maxPerLane = 2;
+          for (let i=0;i<children.length;i+=maxPerLane) lanes.push(children.slice(i,i+maxPerLane));
+
+          let laneTopLeft = cursor;
+          let laneRight = cursor;
+          lanes.forEach(lane => {
+            lane.forEach((child, idx) => {
+              const span = place(child, laneTopLeft + idx*(cardW+cardGapX), depth+1);
+              laneRight = Math.max(laneRight, span.right);
+            });
+            laneTopLeft = laneRight + blockGapX;
+          });
+
+          const gRight = laneRight;
+          spans.push({left:gLeft, right:gRight, sample:children[0]});
+          cursor = gRight + blockGapX;
+        }
+
+        const childrenLeft = spans[0].left;
+        const childrenRight = spans[spans.length-1].right;
+        const center = (childrenLeft + childrenRight)/2;
+        const nodeLeft = center - cardW/2;
+
+        positions.set(node.id, {x:nodeLeft, y, w:cardW, h:cardH, node});
+        if (nodeLeft < childrenLeft) {
+          const shift = childrenLeft - nodeLeft + managerGap;
+          shiftSubtree(node, shift, positions);
+          return {left:childrenLeft, right:childrenRight+shift, center:center+shift/2};
+        }
+
+        spans.forEach(s => {
+          const label = subgroupLabel(s.sample);
+          if (label && s.sample.dep) {
+            groupLabels.push({text:label, x:s.left, y:(depth+1)*(cardH+rowGap)-28});
+          }
+        });
+
+        return {left:Math.min(nodeLeft, childrenLeft), right:Math.max(nodeLeft+cardW, childrenRight), center};
+      }
+
+      function shiftSubtree(node, shift, pos) {
+        const p = pos.get(node.id);
+        if (p) p.x += shift;
+        node.children.forEach(c => shiftSubtree(c, shift, pos));
+      }
+
+      place(root, 40, 0);
+      let maxX = 0, maxY = 0;
+      positions.forEach(p => { maxX = Math.max(maxX, p.x + p.w + 40); maxY = Math.max(maxY, p.y + p.h + 40); });
+
+      return {positions, groupLabels, width:maxX, height:maxY};
+    }
+
+    function render(layout, root) {
+      const nodesEl = document.getElementById('nodes');
+      const svg = document.getElementById('lines');
+      const canvas = document.getElementById('canvas');
+      canvas.style.width = `${layout.width}px`;
+      canvas.style.height = `${layout.height}px`;
+      nodesEl.innerHTML = '';
+      svg.innerHTML = '';
+      svg.setAttribute('width', layout.width);
+      svg.setAttribute('height', layout.height);
+
+      layout.positions.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'node-card';
+        card.style.left = `${p.x}px`;
+        card.style.top = `${p.y}px`;
+        card.innerHTML = `
+          <div class="card-top">
+            <img class="photo" src="${p.node.photo || ''}" onerror="this.style.visibility='hidden'" alt="${escapeHtml(p.node.name)}" />
+            <div>
+              <div class="name">${escapeHtml(p.node.name)}</div>
+              <div class="role">${escapeHtml(p.node.role)}</div>
+            </div>
+          </div>
+          <div class="badges">
+            <span class="badge b-level">${escapeHtml(p.node.level)}</span>
+            ${p.node.dep ? `<span class="badge b-dep">${escapeHtml(p.node.dep)}</span>` : ''}
+            ${p.node.unit ? `<span class="badge b-unit">${escapeHtml(p.node.unit)}</span>` : ''}
+            ${p.node.team ? `<span class="badge b-team">${escapeHtml(p.node.team)}</span>` : ''}
+          </div>`;
+        nodesEl.appendChild(card);
+      });
+
+      layout.groupLabels.forEach(l => {
+        const label = document.createElement('div');
+        label.className = 'group-label';
+        label.textContent = l.text;
+        label.style.left = `${l.x}px`;
+        label.style.top = `${l.y}px`;
+        nodesEl.appendChild(label);
+      });
+
+      drawConnectors(root, layout.positions, svg);
+    }
+
+    function drawConnectors(root, positions, svg) {
+      const all = [];
+      const walk = (n) => { all.push(n); n.children.forEach(walk); };
+      walk(root);
+
+      all.forEach(mgr => {
+        const p = positions.get(mgr.id);
+        if (!p || !mgr.children.length) return;
+        const p1 = {x: p.x + p.w/2, y: p.y + p.h};
+        const midY = p1.y + 24;
+
+        line(p1.x, p1.y, p1.x, midY);
+
+        mgr.children.forEach(ch => {
+          const c = positions.get(ch.id);
+          if (!c) return;
+          const p2 = {x: c.x + c.w/2, y: c.y};
+          line(p1.x, midY, p2.x, midY);
+          line(p2.x, midY, p2.x, p2.y);
+        });
+      });
+
+      function line(x1,y1,x2,y2) {
+        const el = document.createElementNS('http://www.w3.org/2000/svg','line');
+        el.setAttribute('x1', x1); el.setAttribute('y1', y1);
+        el.setAttribute('x2', x2); el.setAttribute('y2', y2);
+        el.setAttribute('stroke', '#9fb2cc'); el.setAttribute('stroke-width', '2');
+        svg.appendChild(el);
+      }
+    }
+
+    function escapeHtml(str) {
+      return (str || '').replace(/[&<>'"]/g, t => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t]));
+    }
+  </script>
+</body>
+</html>
